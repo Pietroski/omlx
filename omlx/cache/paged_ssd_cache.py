@@ -370,7 +370,7 @@ def _block_cachelist_subtypes(
         if not (
             isinstance(layer_data, tuple)
             and len(layer_data) == 2
-            and layer_data[0] == "__cache_list__"
+            and layer_data[0] in ("__cache_list__", "__cache_list_pm__")
             and isinstance(layer_data[1], (list, tuple))
         ):
             continue
@@ -2333,12 +2333,18 @@ class PagedSSDCacheManager(CacheManager):
                     isinstance(layer_data, tuple)
                     and len(layer_data) == 2
                     and isinstance(layer_data[0], str)
-                    and layer_data[0] == "__cache_list__"
+                    and layer_data[0] in ("__cache_list__", "__cache_list_pm__")
                 ):
                     # CacheList: sub-indexed tensors. Each sub_tensor may be
                     # a 2-tuple (legacy) or an ``__nstate__`` marker.
+                    # ``__cache_list_pm__`` marks the per-member storage mode
+                    # (sliceable subs hold per-block slices, non-sliceable
+                    # subs hold boundary state); the mode rides the sidecar
+                    # so load_block can re-tag the payload for reconstruct.
                     sub_tensors = layer_data[1]
                     cache_list_meta[f"layer_{i}_sub_count"] = str(len(sub_tensors))
+                    if layer_data[0] == "__cache_list_pm__":
+                        cache_list_meta[f"layer_{i}_storage_mode"] = "pm"
                     for j, sub_tensor in enumerate(sub_tensors):
                         sub_prefix = f"layer_{i}_sub_{j}"
                         if (
@@ -2693,8 +2699,15 @@ class PagedSSDCacheManager(CacheManager):
                     # Preserve the legacy list shape — callers (prefix_cache,
                     # tests) expect ``cache_data[i]`` to be a list of
                     # sub-cache states for CacheList layers, not a wrapper
-                    # marker.
-                    cache_data.append(sub_tensors)
+                    # marker. Per-member blocks re-tag so reconstruct_cache
+                    # can pick the per-sub restore mode.
+                    if (
+                        file_metadata
+                        and file_metadata.get(f"layer_{i}_storage_mode") == "pm"
+                    ):
+                        cache_data.append(("__cache_list_pm__", sub_tensors))
+                    else:
+                        cache_data.append(sub_tensors)
                 else:
                     layer_marker = _load_nstate(f"layer_{i}", fallback_class=cache_type)
                     if layer_marker is None:

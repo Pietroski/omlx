@@ -36,6 +36,59 @@ from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
+# Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
+_PM_SLICEABLE_SUB_CLASSES = frozenset(
+    {"KVCache", "BatchKVCache", "QuantizedKVCache"}
+)
+# Non-sliceable CacheList member classes safe for per-member block storage.
+# PoolingCache (delta chains) and rotating families keep the legacy
+# cumulative path; ArraysCache state is small, positionless, and
+# self-contained at every boundary.
+_PM_SAFE_NON_SLICEABLE_SUBS = frozenset({"ArraysCache", "SizedArraysCache"})
+
+
+def cachelist_pm_member_plan(
+    sub_class_names: list[str],
+    sub_states: list[Any],
+) -> list[str] | None:
+    """Per-member storage plan for a mixed CacheList layer, or None.
+
+    Returns a list aligned with the sub-caches: ``"slice"`` for 4D
+    sliceable KV members (stored as true per-block slices), ``"boundary"``
+    for ArraysCache-style members (stored from the block's boundary
+    snapshot). ``None`` means the layer is not eligible for per-member
+    storage (missing class info, unknown / PoolingCache / rotating
+    members, or nothing to slice) and must use the legacy cumulative
+    last-block-only path.
+
+    Without this split, a mixed CacheList (e.g. inkling's
+    ``CacheList(KVCache, ArraysCache)``) stores the FULL cumulative state
+    of every member — including the giant KV prefix — in every block:
+    quadratic in context length on both the allocator pool and the SSD.
+    """
+    if not sub_class_names or len(sub_class_names) != len(sub_states):
+        return None
+
+    plan: list[str] = []
+    for class_name, sub_state in zip(sub_class_names, sub_states):
+        shape_sliceable = (
+            isinstance(sub_state, (list, tuple))
+            and len(sub_state) >= 2
+            and hasattr(sub_state[0], "shape")
+            and len(sub_state[0].shape) == 4
+        )
+        if class_name in _PM_SLICEABLE_SUB_CLASSES and shape_sliceable:
+            plan.append("slice")
+        elif class_name in _PM_SAFE_NON_SLICEABLE_SUBS:
+            plan.append("boundary")
+        else:
+            return None
+
+    if "slice" not in plan or "boundary" not in plan:
+        return None
+
+    return plan
+
 logger = logging.getLogger(__name__)
 
 # Cap on the supersede-on-extend lineage map (tip hash -> previous tip hash).
@@ -1516,46 +1569,109 @@ class BlockAwarePrefixCache(CacheManager):
                             list(elements),
                         )
 
-                    if all_sub_sliceable:
+                    def _slice_sub_elements(sub_state):
                         # Per-block slicing along sequence axis. Generic over
                         # the full sub-state tuple length so 4D N-tuple caches
                         # (BatchKVCache: 4 elements with offset/padding meta
                         # at indices 2/3) round-trip without dropping
                         # elements past index 1.
+                        seq_len = sub_state[0].shape[2]
+                        actual_end = min(end_idx, seq_len)
+                        sliced_elements = []
+                        for elem in sub_state:
+                            if (
+                                hasattr(elem, "shape")
+                                and len(elem.shape) == 4
+                                and elem.shape[2] == seq_len
+                            ):
+                                if start_idx >= actual_end:
+                                    sliced_elements.append(
+                                        self._clone_tensor(elem[:, :, 0:0, :])
+                                    )
+                                else:
+                                    sliced_elements.append(
+                                        self._clone_tensor(
+                                            elem[:, :, start_idx:actual_end, :]
+                                        )
+                                    )
+                            else:
+                                # Non-sequence element (e.g. BatchKVCache
+                                # offset/left_padding metadata). Pass
+                                # through unsliced.
+                                sliced_elements.append(
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                        return sliced_elements
+
+                    # Per-member storage plan for mixed CacheLists (sliceable
+                    # KV subs + ArraysCache-style subs). Eligible layers
+                    # store per-block KV slices plus the boundary snapshot's
+                    # small non-sliceable state — linear instead of the
+                    # legacy quadratic cumulative-per-block layout.
+                    pm_plan = cachelist_pm_member_plan(sub_class_names, state)
+                    pm_snapshot_state = None
+                    if (
+                        snapshot_cache_data is not None
+                        and layer_idx < len(snapshot_cache_data)
+                        and isinstance(
+                            snapshot_cache_data[layer_idx].get("state"), list
+                        )
+                    ):
+                        pm_snapshot_state = snapshot_cache_data[layer_idx]["state"]
+                    pm_source_ok = pm_plan is not None and (
+                        is_last_block
+                        or (
+                            pm_snapshot_state is not None
+                            and all(
+                                sub_idx < len(pm_snapshot_state)
+                                and isinstance(
+                                    pm_snapshot_state[sub_idx], (list, tuple)
+                                )
+                                and len(pm_snapshot_state[sub_idx]) >= 1
+                                for sub_idx, mode in enumerate(pm_plan)
+                                if mode == "boundary"
+                            )
+                        )
+                    )
+
+                    if all_sub_sliceable:
                         sub_tensors = []
                         for sub_idx, sub_state in enumerate(state):
-                            seq_len = sub_state[0].shape[2]
-                            actual_end = min(end_idx, seq_len)
-                            sliced_elements = []
-                            for elem in sub_state:
-                                if (
-                                    hasattr(elem, "shape")
-                                    and len(elem.shape) == 4
-                                    and elem.shape[2] == seq_len
-                                ):
-                                    if start_idx >= actual_end:
-                                        sliced_elements.append(
-                                            self._clone_tensor(elem[:, :, 0:0, :])
-                                        )
-                                    else:
-                                        sliced_elements.append(
-                                            self._clone_tensor(
-                                                elem[:, :, start_idx:actual_end, :]
-                                            )
-                                        )
-                                else:
-                                    # Non-sequence element (e.g. BatchKVCache
-                                    # offset/left_padding metadata). Pass
-                                    # through unsliced.
-                                    sliced_elements.append(
-                                        self._clone_tensor(elem)
-                                        if hasattr(elem, "shape")
-                                        else elem
-                                    )
                             sub_tensors.append(
-                                _wrap_sub_marker(sub_idx, sliced_elements)
+                                _wrap_sub_marker(
+                                    sub_idx, _slice_sub_elements(sub_state)
+                                )
                             )
                         block_slices.append(("__cache_list__", sub_tensors))
+                    elif pm_source_ok:
+                        sub_tensors = []
+                        for sub_idx, sub_state in enumerate(state):
+                            if pm_plan[sub_idx] == "slice":
+                                sub_tensors.append(
+                                    _wrap_sub_marker(
+                                        sub_idx, _slice_sub_elements(sub_state)
+                                    )
+                                )
+                                continue
+                            # Boundary member: per-boundary snapshot state for
+                            # non-last blocks, live state at the final
+                            # boundary for the last block.
+                            if not is_last_block and pm_snapshot_state is not None:
+                                source = pm_snapshot_state[sub_idx]
+                            else:
+                                source = sub_state
+                            cloned = [
+                                (
+                                    self._clone_tensor(elem)
+                                    if hasattr(elem, "shape")
+                                    else elem
+                                )
+                                for elem in source
+                            ]
+                            sub_tensors.append(_wrap_sub_marker(sub_idx, cloned))
+                        block_slices.append(("__cache_list_pm__", sub_tensors))
                     else:
                         # Non-sliceable sub-caches: last-block-only or snapshot.
                         # This is the path PoolingCache takes (3D buf_kv).
@@ -2346,14 +2462,27 @@ class BlockAwarePrefixCache(CacheManager):
                             return sub_state[1]
                         return None
 
-                    # Collect CacheList data from all blocks that have List[sub_state]
+                    # Collect CacheList data from all blocks that have List[sub_state].
+                    # Per-member blocks arrive as ``('__cache_list_pm__', [subs])``
+                    # (re-tagged by load_block from sidecar metadata); unwrap
+                    # and remember which blocks used the per-member layout.
                     cl_block_data = []
+                    cl_block_pm_flags = []
                     for block_data in all_block_data:
                         bd = block_data[layer_idx]
+                        bd_pm = (
+                            isinstance(bd, tuple)
+                            and len(bd) == 2
+                            and isinstance(bd[0], str)
+                            and bd[0] == "__cache_list_pm__"
+                        )
+                        if bd_pm:
+                            bd = bd[1]
                         if isinstance(bd, list) and all(
                             _sub_state_elements(t) is not None for t in bd
                         ):
                             cl_block_data.append(bd)
+                            cl_block_pm_flags.append(bd_pm)
 
                     if not cl_block_data:
                         logger.error(
@@ -2428,7 +2557,89 @@ class BlockAwarePrefixCache(CacheManager):
                         for elems in last_block_elements
                     )
 
-                    if len(cl_block_data) > 1 and stored_slice_mode:
+                    pm_mode = any(cl_block_pm_flags)
+                    if pm_mode and not all(cl_block_pm_flags):
+                        # A chain mixing legacy cumulative blocks with
+                        # per-member blocks cannot be restored coherently:
+                        # concatenating a cumulative KV snapshot duplicates
+                        # the sequence, and last-blocking a per-member chain
+                        # drops KV. Reject; the request re-prefills.
+                        logger.info(
+                            f"CacheList layer {layer_idx}: mixed legacy/"
+                            f"per-member block chain. Rejecting cache."
+                        )
+                        return None
+
+                    if pm_mode:
+                        # Per-member restore: sliceable KV subs concatenate
+                        # their per-block slices along the sequence axis;
+                        # boundary members (ArraysCache-style) take the last
+                        # matched block's state, which snapshots the cache at
+                        # exactly that boundary. Never apply the generic
+                        # column concat to boundary members — their 3D conv
+                        # tensors would concatenate along channels.
+                        concatenated_sub_states = []
+                        for j in range(num_sub_caches):
+                            per_block_elements = [
+                                _sub_state_elements(bd[j]) for bd in cl_block_data
+                            ]
+                            if any(e is None for e in per_block_elements):
+                                logger.error(
+                                    f"CacheList layer {layer_idx}: invalid "
+                                    f"per-member sub {j} state"
+                                )
+                                return None
+                            elems_last = per_block_elements[-1]
+                            class_j = (
+                                sub_class_names_for_layer[j]
+                                if j < len(sub_class_names_for_layer)
+                                else ""
+                            )
+                            is_slice_sub = (
+                                class_j in _PM_SLICEABLE_SUB_CLASSES
+                                if class_j
+                                else (
+                                    len(elems_last) >= 2
+                                    and hasattr(elems_last[0], "shape")
+                                    and len(elems_last[0].shape) == 4
+                                )
+                            )
+                            if is_slice_sub and len(per_block_elements) > 1:
+                                cat_elements = []
+                                for k in range(len(elems_last)):
+                                    column = [pb[k] for pb in per_block_elements]
+                                    first = column[0]
+                                    if (
+                                        hasattr(first, "shape")
+                                        and len(first.shape) == 4
+                                        and all(
+                                            hasattr(c, "shape")
+                                            and len(c.shape) == 4
+                                            and c.shape[:2] == first.shape[:2]
+                                            for c in column
+                                        )
+                                    ):
+                                        if any(d == 0 for d in first.shape):
+                                            shape = list(first.shape)
+                                            shape[2] = sum(
+                                                c.shape[2] for c in column
+                                            )
+                                            cat_elements.append(
+                                                mx.zeros(tuple(shape))
+                                            )
+                                        else:
+                                            cat_elements.append(
+                                                mx.concatenate(column, axis=2)
+                                            )
+                                    else:
+                                        # Non-sequence element (BatchKVCache
+                                        # offset/padding metadata): last
+                                        # block's value.
+                                        cat_elements.append(column[-1])
+                                concatenated_sub_states.append(tuple(cat_elements))
+                            else:
+                                concatenated_sub_states.append(tuple(elems_last))
+                    elif len(cl_block_data) > 1 and stored_slice_mode:
                         # Per-block slices: concatenate every sub along the
                         # sequence axis into the full sequence.
                         concatenated_sub_states = []

@@ -49,7 +49,7 @@ from mlx_lm.sample_utils import make_logits_processors
 from .cache.observability import CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
-from .cache.prefix_cache import BlockAwarePrefixCache
+from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -5519,7 +5519,7 @@ class Scheduler:
         """
         if not snapshot_cache:
             return
-        extracted, _ = self._extract_cache_states(snapshot_cache)
+        extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
         leaves = self._collect_arrays_from_extracted_cache(extracted)
         if leaves:
             with mx.stream(self._stream):
@@ -5570,7 +5570,7 @@ class Scheduler:
                     request_id,
                     token_count,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -5617,6 +5617,45 @@ class Scheduler:
             return extracted
         self._eval_snapshot_cache(snapshot_cache)
         return snapshot_cache
+
+    def _extract_snapshot_cache_states(
+        self, snapshot_cache: list[Any]
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Extract snapshot states with sliceable CacheList members blanked.
+
+        Boundary snapshots exist for non-sliceable state; for mixed
+        CacheList layers eligible for per-member block storage the KV
+        member is sliced from the live cache at store time and never read
+        from the snapshot. Persisting it anyway made every boundary
+        snapshot carry the full KV prefix — quadratic in context length
+        across a request's snapshots (RAM transients and the boundary
+        SSD store). Blank those members to ``()``;
+        ``_merge_boundary_with_full_cache`` refills them member-wise when
+        a snapshot is promoted to a store source.
+        """
+        extracted, tokens = self._extract_cache_states(snapshot_cache)
+        for layer in extracted or []:
+            if not isinstance(layer, dict):
+                continue
+            if str(layer.get("class_name") or "") != "CacheList":
+                continue
+            state = layer.get("state")
+            meta = layer.get("meta_state")
+            if not (
+                isinstance(state, list)
+                and isinstance(meta, (list, tuple))
+                and len(meta) >= 1
+                and isinstance(meta[0], (list, tuple))
+            ):
+                continue
+            plan = cachelist_pm_member_plan([str(n) for n in meta[0]], state)
+            if plan is None:
+                continue
+            layer["state"] = [
+                () if mode == "slice" else sub_state
+                for mode, sub_state in zip(plan, state)
+            ]
+        return extracted, tokens
 
     def _decode_boundary_snapshot_value(
         self, snapshot_cache: list[Any], token_count: int, block_size: int
@@ -5674,7 +5713,7 @@ class Scheduler:
                 mx.default_device()
             )
             with mx.stream(stream):
-                extracted, _ = self._extract_cache_states(snapshot_cache)
+                extracted, _ = self._extract_snapshot_cache_states(snapshot_cache)
                 if not extracted:
                     return None
                 for layer_state in extracted:
@@ -5868,7 +5907,7 @@ class Scheduler:
                     request.request_id,
                     total_tokens,
                     snapshot_cache,
-                    self._extract_cache_states,
+                    self._extract_snapshot_cache_states,
                     block_size=block_size,
                 )
             if saved:
@@ -6008,7 +6047,7 @@ class Scheduler:
                 provider_tcs.append(tc)
                 continue
 
-            extracted_snapshot, _ = self._extract_cache_states(snap)
+            extracted_snapshot, _ = self._extract_snapshot_cache_states(snap)
             if extracted_snapshot:
                 extracted_in_memory[tc] = extracted_snapshot
                 provider_tcs.append(tc)
@@ -6055,6 +6094,31 @@ class Scheduler:
             if isinstance(state, tuple) and len(state) == 0:
                 # Take full cache layer instead.
                 merged.append(fc)
+                continue
+            # Member-filtered CacheList snapshots
+            # (_extract_snapshot_cache_states) blank sliceable members to
+            # ``()``. Refill those member-wise from the full extracted
+            # layer so the store path sees real KV tensors to slice; the
+            # snapshot's non-sliceable members stay authoritative.
+            full_state = fc.get("state") if isinstance(fc, dict) else None
+            if (
+                isinstance(state, list)
+                and isinstance(full_state, list)
+                and len(state) == len(full_state)
+                and any(
+                    isinstance(s, (list, tuple)) and len(s) == 0 for s in state
+                )
+            ):
+                refilled = dict(bc)
+                refilled["state"] = [
+                    (
+                        full_sub
+                        if isinstance(sub, (list, tuple)) and len(sub) == 0
+                        else sub
+                    )
+                    for sub, full_sub in zip(state, full_state)
+                ]
+                merged.append(refilled)
             else:
                 merged.append(bc)
         return merged

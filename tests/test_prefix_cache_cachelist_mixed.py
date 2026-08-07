@@ -321,6 +321,9 @@ def test_prefill_snapshot_decoupled_from_live_cache():
     stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
         stub, caches
     )
+    stub._extract_snapshot_cache_states = (
+        lambda caches: Scheduler._extract_snapshot_cache_states(stub, caches)
+    )
     stub._extract_prefill_snapshot_states = (
         lambda caches: Scheduler._extract_prefill_snapshot_states(stub, caches)
     )
@@ -345,10 +348,14 @@ def test_prefill_snapshot_decoupled_from_live_cache():
     assert isinstance(stored, tuple)
     assert stored[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
     extracted = stored[1]
+    # Per-member filtering blanks the sliceable KV member — snapshots only
+    # need the non-sliceable state; the store path slices KV from the live
+    # cache. The conv slots remain the aliasing guard: they must hold the
+    # boundary's values even after the live cache moves on.
     kv_state = extracted[0]["state"][0]
-    assert kv_state[0].shape[2] == BLOCK_SIZE, (
-        "boundary snapshot follows the live cache (aliasing) — "
-        f"holds {kv_state[0].shape[2]} tokens instead of {BLOCK_SIZE}"
+    assert kv_state == (), (
+        "pm-eligible snapshot should blank the sliceable KV member, "
+        f"got {kv_state!r}"
     )
     conv_slot0 = extracted[0]["state"][1][0]
     assert mx.max(mx.abs(conv_slot0 - BLOCK_SIZE)).item() == 0.0
