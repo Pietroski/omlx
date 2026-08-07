@@ -1826,6 +1826,13 @@ class Scheduler:
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
         self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
+        # Cooperative store_cache cancellation. shutdown() sets this so an
+        # in-flight store stops at the next block boundary instead of pinning
+        # engine teardown behind a long cache write — the 60s teardown
+        # watchdog otherwise fatal-exits the whole server while a
+        # many-snapshot store is still grinding (observed with CacheList
+        # models at 70k+ token contexts).
+        self._store_cache_abort = threading.Event()
         self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
         # Admission-only cache freshness waits. A waiting request can pause at
         # the front of the queue for a relevant in-flight store without
@@ -2200,6 +2207,7 @@ class Scheduler:
                         extra_keys=extra_keys,
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
+                        should_abort=self._store_cache_abort.is_set,
                     )
                 else:
                     block_table = self.block_aware_cache.store_cache(
@@ -2212,6 +2220,7 @@ class Scheduler:
                         extra_key_token_start=extra_key_token_start,
                         extra_key_ranges=extra_key_ranges,
                         hot_cache_write_back=False,
+                        should_abort=self._store_cache_abort.is_set,
                     )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
@@ -10995,6 +11004,13 @@ class Scheduler:
         # cache see all blocks before close().
         if self._store_cache_executor is not None:
             try:
+                # Ask any in-flight store to stop at its next block boundary:
+                # a cache write is safe to abandon, and waiting a full
+                # FATAL_TEARDOWN_TIMEOUT_S on a many-snapshot store otherwise
+                # turns an eviction into a watchdog fatal_exit of the whole
+                # server (observed repeatedly with CacheList models at
+                # 70k+ token contexts under memory pressure).
+                self._store_cache_abort.set()
                 inflight = list(self._inflight_store_futures.values())
                 if inflight:
                     logger.info(

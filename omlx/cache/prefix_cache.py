@@ -36,6 +36,18 @@ from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
+# Allocator-pool ceiling for store_cache (bytes). Boundary snapshots carry the
+# full non-sliceable cache state at strictly growing token counts, so their
+# transient buffers all have distinct sizes: once freed they land in the MLX
+# allocator pool and are never reused (the next snapshot is bigger) nor
+# returned to the OS. Over a long-context store (dozens of snapshots) the pool
+# grows quadratically with context length — 78k tokens ≈ 37 snapshots ≈
+# >200 GB of dead pooled buffers — while the inference thread's
+# _sync_and_clear_cache is locked out by _mx_buffer_access_lock for the whole
+# store. Trimming from the worker itself (same thread as the buffer reads, so
+# inherently serialized) caps the pool at O(largest single snapshot).
+_STORE_POOL_TRIM_BYTES = 8 << 30
+
 logger = logging.getLogger(__name__)
 
 # Cap on the supersede-on-extend lineage map (tip hash -> previous tip hash).
@@ -469,6 +481,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
+        should_abort: Callable[[], bool] | None = None,
         _store_exact_terminal: bool = False,
     ) -> BlockTable | None:
         """
@@ -492,6 +505,11 @@ class BlockAwarePrefixCache(CacheManager):
                 ArraysCache state instead of placeholders in hybrid models.
             hot_cache_write_back: When False, SSD-backed hot cache is bypassed
                 for newly stored dirty blocks.
+            should_abort: Optional callable polled between blocks. When it
+                returns True the store stops cleanly after the current block:
+                blocks already persisted stay valid, the rest are simply not
+                stored. Lets engine teardown cancel a long-running store (a
+                cache write is safe to abandon; the server is not).
             _store_exact_terminal: Internal exact-prefix mode that persists the
                 trailing partial block and isolates the terminal hash from
                 ordinary prefix matching.
@@ -596,6 +614,16 @@ class BlockAwarePrefixCache(CacheManager):
         tip_block_saved = False
 
         for i in range(num_new_blocks):
+            if should_abort is not None and should_abort():
+                logger.info(
+                    "store_cache aborted for %s after %d/%d block(s) "
+                    "(cooperative teardown); stored blocks remain valid",
+                    request_id,
+                    i,
+                    num_new_blocks,
+                )
+                break
+
             start_idx = i * self.block_size
             end_idx = min(start_idx + self.block_size, len(new_tokens))
             block_tokens = new_tokens[start_idx:end_idx]
@@ -846,6 +874,21 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
                     break
+
+                # Drop this block's boundary snapshot (an SSD-loaded snapshot
+                # is a fresh object per __getitem__; releasing the reference
+                # frees its buffers into the allocator pool) and trim the
+                # pool when it exceeds the ceiling. Snapshot transients have
+                # strictly growing, never-reused sizes, so without this the
+                # pool grows quadratically with context length over the
+                # store — see _STORE_POOL_TRIM_BYTES. Running on the store
+                # worker itself keeps the trim serialized with this thread's
+                # buffer-protocol reads (the same guarantee
+                # _mx_buffer_access_lock gives the inference-thread clear).
+                snapshot_cache_data = None
+                block_kv_data = None
+                if HAS_MLX and mx.get_cache_memory() > _STORE_POOL_TRIM_BYTES:
+                    mx.clear_cache()
 
         # Supersede-on-extend: on rotating (sliding-window) models every store
         # of a growing conversation writes one tip block carrying the full
