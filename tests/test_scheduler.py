@@ -983,6 +983,7 @@ class TestSchedulerAddRequest:
             extra_key_token_start=None,
             extra_key_ranges=None,
             hot_cache_write_back=False,
+            should_abort=scheduler._store_cache_abort.is_set,
         )
 
 
