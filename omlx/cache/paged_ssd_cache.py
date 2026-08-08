@@ -324,6 +324,35 @@ _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
 
 _ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
 _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+_PM_SLICEABLE_SUB_CLASSES = frozenset(
+    {"KVCache", "BatchKVCache", "QuantizedKVCache"}
+)
+
+# Storage-layout token appended to a mixed CacheList layer's subtype
+# descriptor when the layer uses per-member block storage. Part of the
+# compatibility identity: legacy cumulative blocks lack the token, so the
+# stale-signature sweep invalidates them instead of letting token-hash
+# dedup keep splicing them into per-member chains (#2550 review).
+_PM_LAYOUT_TOKEN = "@pm"
+
+
+def cachelist_pm_class_eligible(sub_class_names: list[str]) -> bool:
+    """Class-level eligibility for per-member CacheList block storage.
+
+    True when every member is either a sliceable KV class or an
+    ArraysCache-style class, with at least one of each. Must stay in sync
+    with ``prefix_cache.cachelist_pm_member_plan`` (which additionally
+    checks live tensor shapes at store time).
+    """
+    if not sub_class_names:
+        return False
+    names = [str(n) for n in sub_class_names]
+    has_slice = any(n in _PM_SLICEABLE_SUB_CLASSES for n in names)
+    has_boundary = any(n in _ARRAYS_SUB_CLASSES for n in names)
+    all_known = all(
+        n in _PM_SLICEABLE_SUB_CLASSES or n in _ARRAYS_SUB_CLASSES for n in names
+    )
+    return has_slice and has_boundary and all_known
 
 
 def _canonical_sub_name(name: Any) -> str:
@@ -411,6 +440,8 @@ def _block_cachelist_subtypes(
             else:
                 descriptors.append(name or "?")
         if descriptors and has_non_sliceable:
+            if layer_data[0] == "__cache_list_pm__":
+                descriptors.append(_PM_LAYOUT_TOKEN)
             subtypes[str(i)] = descriptors
     return subtypes or None
 
@@ -449,6 +480,11 @@ def cachelist_subtypes_from_cache_list(
             else:
                 descriptors.append(name or "?")
         if descriptors and has_non_sliceable:
+            sub_names = [
+                _canonical_sub_name(type(sub).__name__) for sub in sub_caches
+            ]
+            if cachelist_pm_class_eligible(sub_names):
+                descriptors.append(_PM_LAYOUT_TOKEN)
             subtypes[str(i)] = descriptors
     return subtypes or None
 

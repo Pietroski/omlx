@@ -278,3 +278,156 @@ def test_filtered_snapshots_store_correctly(tmp_path):
     table = _store_blocks(cache, num_blocks=3, request_id="req-blank", blank_kv=True)
     assert table is not None
     _assert_restored(cache.reconstruct_cache(table), expected_seq_len=3 * BLOCK_SIZE)
+
+
+# ---------------------------------------------------------------------------
+# #2550 review fixes
+# ---------------------------------------------------------------------------
+
+
+def test_missing_middle_snapshot_truncates_store(tmp_path):
+    """A missing middle boundary snapshot must truncate the store at that
+    boundary — never produce a pm/placeholder/pm chain that restores fewer
+    KV tokens than block_table.num_tokens claims."""
+    cache, _ = _make_cache(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    snapshots = _boundary_snapshots(num_blocks)
+    del snapshots[2 * BLOCK_SIZE]  # omit the middle boundary
+
+    table = cache.store_cache(
+        "req-gap",
+        tokens,
+        _cache_data(len(tokens)),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None
+    # Only the first block (boundary 4) is persisted.
+    assert len(table.block_ids) == 1
+    assert table.num_tokens == BLOCK_SIZE
+    _assert_restored(cache.reconstruct_cache(table), expected_seq_len=BLOCK_SIZE)
+
+
+def test_restore_rejects_short_kv_chain(tmp_path, monkeypatch):
+    """Reviewer repro: pm / placeholder / pm chain. The placeholder block is
+    skipped by the collector, so restored KV would be 8 tokens against
+    num_tokens=12 — the length check must reject the cache."""
+    real_plan = prefix_cache_module.cachelist_pm_member_plan
+    calls = {"n": 0}
+
+    def first_call_none(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # defeats pm_layers_present -> no store truncation
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(
+        prefix_cache_module, "cachelist_pm_member_plan", first_call_none
+    )
+
+    cache, _ = _make_cache(tmp_path)
+    num_blocks = 3
+    tokens = list(range(num_blocks * BLOCK_SIZE))
+    snapshots = _boundary_snapshots(num_blocks)
+    del snapshots[2 * BLOCK_SIZE]  # middle block becomes a placeholder
+
+    table = cache.store_cache(
+        "req-short",
+        tokens,
+        _cache_data(len(tokens)),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None
+    assert len(table.block_ids) == 3
+
+    assert cache.reconstruct_cache(table) is None
+
+
+def test_legacy_blocks_swept_on_pm_expectation(tmp_path, monkeypatch):
+    """Upgrade path (#2550 review): pre-upgrade legacy blocks must be
+    invalidated by the layout-aware signature, so a post-upgrade store
+    cannot recreate a mixed chain via token-hash dedup."""
+    from omlx.cache.paged_ssd_cache import cachelist_subtypes_from_cache_list
+
+    # The live-model expectation now carries the layout token.
+    live = [_build_mixed_cachelist(seq_len=4)]
+    assert cachelist_subtypes_from_cache_list(live) == {
+        "0": ["KVCache", "ArraysCache:4", "@pm"]
+    }
+
+    # Pre-upgrade store: legacy cumulative blocks (no @pm stamp).
+    monkeypatch.setattr(
+        prefix_cache_module, "cachelist_pm_member_plan", lambda *a, **k: None
+    )
+    cache, ssd = _make_cache(tmp_path)
+    table = cache.store_cache(
+        "req-old",
+        list(range(2 * BLOCK_SIZE)),
+        _cache_data(2 * BLOCK_SIZE),
+        boundary_snapshots=_boundary_snapshots(2),
+    )
+    assert table is not None
+    monkeypatch.undo()
+
+    # "Restart on upgraded code": live expectation adopts the pm layout.
+    changed = ssd.set_expected_layer_signature(
+        ["CacheList"],
+        cachelist_subtypes={"0": ["KVCache", "ArraysCache:4", "@pm"]},
+    )
+    assert changed is True
+    ssd.invalidate_stale_layer_signature()
+
+    # Legacy blocks are no longer restorable...
+    assert cache.reconstruct_cache(table) is None
+
+    # ...and a fresh store of the same tokens yields a pure pm chain that
+    # restores — the mixed chain cannot be recreated.
+    table2 = cache.store_cache(
+        "req-new",
+        list(range(2 * BLOCK_SIZE)),
+        _cache_data(2 * BLOCK_SIZE),
+        boundary_snapshots=_boundary_snapshots(2),
+    )
+    assert table2 is not None
+    assert len(table2.block_ids) == 2
+    _assert_restored(cache.reconstruct_cache(table2), expected_seq_len=2 * BLOCK_SIZE)
+
+
+def test_decode_snapshot_fallback_filters_kv(tmp_path):
+    """In-memory decode-snapshot fallback (#2550 review): the stored value
+    must be pre-extracted with the KV member blanked, not the raw CacheList
+    retaining the full KV prefix."""
+    from types import SimpleNamespace
+
+    from omlx.scheduler import Scheduler
+
+    live = _build_mixed_cachelist(seq_len=BLOCK_SIZE)
+
+    stub = SimpleNamespace(
+        _stream=mx.default_stream(mx.default_device()),
+        _PREFILL_SNAPSHOT_MARKER=Scheduler._PREFILL_SNAPSHOT_MARKER,
+    )
+    stub._extract_cache_states = lambda caches: Scheduler._extract_cache_states(
+        stub, caches
+    )
+    stub._extract_snapshot_cache_states = (
+        lambda caches: Scheduler._extract_snapshot_cache_states(stub, caches)
+    )
+    stub._extract_prefill_snapshot_states = (
+        lambda caches: Scheduler._extract_prefill_snapshot_states(stub, caches)
+    )
+    stub._prefill_snapshot_value = lambda caches: Scheduler._prefill_snapshot_value(
+        stub, caches
+    )
+    stub._eval_snapshot_cache = lambda caches: None
+
+    value = Scheduler._decode_boundary_snapshot_value(
+        stub, [live], BLOCK_SIZE, BLOCK_SIZE
+    )
+
+    assert isinstance(value, tuple)
+    assert value[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
+    extracted = value[1]
+    assert extracted[0]["state"][0] == (), "KV member must be blanked"
+    conv_slot0 = extracted[0]["state"][1][0]
+    assert mx.max(mx.abs(conv_slot0 - BLOCK_SIZE)).item() == 0.0

@@ -2233,8 +2233,17 @@ class TestSchedulerBoundarySnapshots:
 
         assert 4 in scheduler._boundary_cache_snapshots["req-boundary"]
         snapshot = scheduler._boundary_cache_snapshots["req-boundary"][4]
-        # Non-sliceable cache layer is kept as-is in the snapshot
-        assert snapshot == [mock_layer_cache]
+        # The in-memory fallback pre-extracts eagerly (retaining raw cache
+        # objects kept the full KV member of pm-eligible CacheLists alive
+        # per boundary — the quadratic-RAM fallback gap from the #2550
+        # review). A stub layer that defeats extraction falls back to the
+        # raw objects, so both shapes are legitimate; the raw list must
+        # only appear via the explicit fallback, marker-free.
+        if isinstance(snapshot, tuple):
+            assert snapshot[0] == Scheduler._PREFILL_SNAPSHOT_MARKER
+            assert len(snapshot[1]) == 1
+        else:
+            assert snapshot == [mock_layer_cache]
 
     def test_boundary_snapshot_skipped_on_speculative_skew(
         self, mock_model, mock_tokenizer

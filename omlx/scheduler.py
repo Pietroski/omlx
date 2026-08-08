@@ -5668,12 +5668,18 @@ class Scheduler:
         PoolingCache case so its cumulative ``pooled`` tensor can be stored as
         a single-block delta.
         """
+        # Extract eagerly instead of retaining raw cache objects: a raw
+        # CacheList keeps its full KV member alive for every recorded
+        # boundary, which reintroduces the quadratic RAM cost in the
+        # SSD-store-unavailable fallback (#2551). The extraction path runs
+        # the per-member snapshot filter (_extract_snapshot_cache_states),
+        # so pm-eligible layers hold only their small non-sliceable state.
+        value = self._prefill_snapshot_value(snapshot_cache)
         if not _contains_pooling_cache(snapshot_cache):
-            self._eval_snapshot_cache(snapshot_cache)
-            return snapshot_cache
+            return value
 
         return _compact_boundary_snapshot_value(
-            self._prefill_snapshot_value(snapshot_cache),
+            value,
             token_count,
             block_size,
             self._stream,

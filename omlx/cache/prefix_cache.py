@@ -641,6 +641,41 @@ class BlockAwarePrefixCache(CacheManager):
             )
 
         blocks_saved_to_ssd = 0
+        # Per-member CacheList layers need a boundary snapshot for every
+        # non-last block. A missing middle snapshot must TRUNCATE the store
+        # at that boundary: falling through to a placeholder produces a
+        # per-member/placeholder/per-member chain whose reconstruction
+        # silently skips the placeholder block's KV tokens (restored KV
+        # shorter than block_table.num_tokens -> scheduler skips tokens).
+        pm_layers_present = False
+        if is_tensor_data:
+            for layer_state in cache_data:
+                if not isinstance(layer_state, dict):
+                    continue
+                type_name = str(
+                    layer_state.get("class_name")
+                    or layer_state.get("cache_type")
+                    or ""
+                )
+                if type_name != "CacheList":
+                    continue
+                names = layer_state.get("sub_class_names") or []
+                if not names:
+                    meta = layer_state.get("meta_state")
+                    if (
+                        isinstance(meta, (list, tuple))
+                        and len(meta) >= 1
+                        and isinstance(meta[0], (list, tuple))
+                    ):
+                        names = [str(n) for n in meta[0]]
+                if (
+                    cachelist_pm_member_plan(
+                        list(names), layer_state.get("state") or []
+                    )
+                    is not None
+                ):
+                    pm_layers_present = True
+                    break
         require_contiguous_pooling_snapshots = bool(
             boundary_snapshots
         ) and _contains_pooling_cache_state(cache_data)
@@ -660,6 +695,19 @@ class BlockAwarePrefixCache(CacheManager):
             has_boundary_snapshot = (
                 boundary_snapshots is not None and global_end in boundary_snapshots
             )
+
+            if pm_layers_present and not is_last_block and not has_boundary_snapshot:
+                logger.info(
+                    "store_cache truncated for %s at block %d/%d: missing "
+                    "boundary snapshot at token %d for a per-member CacheList "
+                    "layer (stored prefix stays valid; remaining blocks are "
+                    "not persisted)",
+                    request_id,
+                    i,
+                    num_new_blocks,
+                    global_end,
+                )
+                break
 
             # PoolingCache boundary snapshots form an absolute-range delta
             # chain. Publishing a placeholder for a missing middle boundary
@@ -2579,6 +2627,7 @@ class BlockAwarePrefixCache(CacheManager):
                         # column concat to boundary members — their 3D conv
                         # tensors would concatenate along channels.
                         concatenated_sub_states = []
+                        pm_slice_sub_indices: list[int] = []
                         for j in range(num_sub_caches):
                             per_block_elements = [
                                 _sub_state_elements(bd[j]) for bd in cl_block_data
@@ -2604,6 +2653,8 @@ class BlockAwarePrefixCache(CacheManager):
                                     and len(elems_last[0].shape) == 4
                                 )
                             )
+                            if is_slice_sub:
+                                pm_slice_sub_indices.append(j)
                             if is_slice_sub and len(per_block_elements) > 1:
                                 cat_elements = []
                                 for k in range(len(elems_last)):
@@ -2639,6 +2690,34 @@ class BlockAwarePrefixCache(CacheManager):
                                 concatenated_sub_states.append(tuple(cat_elements))
                             else:
                                 concatenated_sub_states.append(tuple(elems_last))
+
+                        # Defense-in-depth (#2550 review): the restored KV
+                        # length must equal the matched token count. A chain
+                        # with a skipped/short block would otherwise hand the
+                        # scheduler a shorter cache than block_table.num_tokens
+                        # claims, silently skipping the difference.
+                        for j in pm_slice_sub_indices:
+                            sub_state = concatenated_sub_states[j]
+                            if (
+                                not sub_state
+                                or not hasattr(sub_state[0], "shape")
+                                or len(sub_state[0].shape) != 4
+                                or sub_state[0].shape[2] != block_table.num_tokens
+                            ):
+                                got = (
+                                    sub_state[0].shape[2]
+                                    if sub_state
+                                    and hasattr(sub_state[0], "shape")
+                                    and len(sub_state[0].shape) == 4
+                                    else "?"
+                                )
+                                logger.warning(
+                                    f"CacheList layer {layer_idx}: per-member "
+                                    f"restored KV length {got} != expected "
+                                    f"{block_table.num_tokens} tokens. "
+                                    f"Rejecting cache."
+                                )
+                                return None
                     elif len(cl_block_data) > 1 and stored_slice_mode:
                         # Per-block slices: concatenate every sub along the
                         # sequence axis into the full sequence.
