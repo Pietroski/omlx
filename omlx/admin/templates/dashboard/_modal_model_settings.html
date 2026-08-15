@@ -573,7 +573,7 @@
                                                     @click="modelSettings.ctKwargEntries.push({type: 'enable_thinking', value: 'true', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_enable_thinking') }}</button>
                                             <button type="button"
-                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort')"
+                                                    x-show="!modelSettings.is_diffusion_model && !modelSettings.ctKwargEntries.some(e => e.type === 'reasoning_effort' || (e.type === 'custom' && e.key && e.key.trim() === 'reasoning_effort'))"
                                                     @click="modelSettings.ctKwargEntries.push({type: 'reasoning_effort', value: 'low', force: false}); addOpen = false"
                                                     class="w-full text-left px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 transition-colors">{{ t('modal.model_settings.kwarg_reasoning_effort') }}</button>
                                             <button type="button"

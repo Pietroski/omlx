@@ -66,3 +66,15 @@ def test_reasoning_effort_is_freeform_input_with_suggestions():
     order = ["low", "medium", "high", "xhigh", "max"]
     positions = [datalist.index(f'value="{value}"') for value in order]
     assert positions == sorted(positions)
+
+
+def test_reasoning_effort_add_guard_covers_custom_entries():
+    """Stored reasoning_effort reloads as a custom entry, so the add-dropdown
+    guard must hide the typed option when either shape owns the key."""
+    html = _model_settings_template()
+
+    guard = (
+        "e.type === 'reasoning_effort' || "
+        "(e.type === 'custom' && e.key && e.key.trim() === 'reasoning_effort')"
+    )
+    assert guard in html

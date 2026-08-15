@@ -6899,13 +6899,11 @@
                             value: String(value),
                             force: forced.has('enable_thinking'),
                         });
-                    } else if (key === 'reasoning_effort') {
-                        entries.push({
-                            type: 'reasoning_effort',
-                            value: String(value),
-                            force: forced.has('reasoning_effort'),
-                        });
                     } else {
+                        // reasoning_effort deliberately loads here as a plain
+                        // custom entry: stored values are the source of truth
+                        // and must never be captured/relabeled by the typed
+                        // add-option (which exists only to seed new entries).
                         entries.push({
                             type: 'custom',
                             key,
