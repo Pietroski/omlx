@@ -612,13 +612,22 @@
                                                 </select>
                                             </template>
                                             <template x-if="entry.type === 'reasoning_effort'">
-                                                <select x-model="entry.value"
-                                                        class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                    <option value="low">{{ t('modal.model_settings.kwarg_effort_low') }}</option>
-                                                    <option value="medium">{{ t('modal.model_settings.kwarg_effort_medium') }}</option>
-                                                    <option value="high">{{ t('modal.model_settings.kwarg_effort_high') }}</option>
-                                                    <option value="max">max</option>
-                                                </select>
+                                                <div class="flex-1">
+                                                    <!-- Free-form: models disagree on the vocabulary
+                                                         (Qwen3.8 "xhigh", Inkling numeric 0.1-0.99), so the
+                                                         entry passes values through and each chat template
+                                                         validates its own. -->
+                                                    <input type="text" list="reasoning-effort-options" x-model="entry.value"
+                                                           placeholder="low / medium / high / xhigh / max or a number"
+                                                           class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <datalist id="reasoning-effort-options">
+                                                        <option value="low"></option>
+                                                        <option value="medium"></option>
+                                                        <option value="high"></option>
+                                                        <option value="xhigh"></option>
+                                                        <option value="max"></option>
+                                                    </datalist>
+                                                </div>
                                             </template>
                                             <template x-if="entry.type !== 'custom'">
                                                 <label class="flex items-center gap-1 flex-shrink-0" title="{{ t('modal.model_settings.kwarg_force_tooltip') }}">

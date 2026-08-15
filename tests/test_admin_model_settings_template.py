@@ -43,12 +43,26 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
-def test_reasoning_effort_offers_max_after_high():
+def test_reasoning_effort_is_freeform_input_with_suggestions():
+    """The effort entry must be free-form: models disagree on the vocabulary
+    (Qwen3.8 "xhigh", Inkling numeric 0.1-0.99), so a fixed <select> silently
+    degrades unknown values to its first option on panel reload."""
     html = _model_settings_template()
 
-    high_option = '<option value="high">'
-    max_option = '<option value="max">max</option>'
+    # The effort input block is the SECOND template with this marker (the
+    # first renders the entry label); enable_thinking's <select> sits between.
+    marker = "<template x-if=\"entry.type === 'reasoning_effort'\">"
+    section = html.split(marker, 2)[2].split(
+        "<template x-if=\"entry.type !== 'custom'\">", 1
+    )[0]
 
-    assert high_option in html
-    assert max_option in html
-    assert html.index(high_option) < html.index(max_option)
+    assert '<input type="text"' in section
+    assert 'list="reasoning-effort-options"' in section
+    assert "<select" not in section
+
+    datalist = _section(
+        html, '<datalist id="reasoning-effort-options">', "</datalist>"
+    )
+    order = ["low", "medium", "high", "xhigh", "max"]
+    positions = [datalist.index(f'value="{value}"') for value in order]
+    assert positions == sorted(positions)

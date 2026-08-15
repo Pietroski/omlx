@@ -314,7 +314,10 @@ class ChatCompletionRequest(BaseModel):
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # OpenAI-compatible reasoning depth; forwarded to the chat template.
-    reasoning_effort: Optional[str] = None
+    # Numbers stay numbers: models like Inkling take a numeric effort
+    # (0.1-0.99) while Qwen3.8 uses strings ("low".."xhigh") — each chat
+    # template validates its own vocabulary.
+    reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
